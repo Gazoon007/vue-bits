@@ -104,6 +104,7 @@ export const CATEGORIES = [
       'Dome Gallery',
       'Elastic Slider',
       'Flowing Menu',
+      'Fluid Glass',
       'Flying Posters',
       'Folder',
       'Glass Icons',

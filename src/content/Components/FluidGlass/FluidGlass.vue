@@ -1,31 +1,19 @@
 <template>
-  <div
-    ref="containerRef"
-    :class="['fluid-glass', props.className]"
-    @pointermove="handlePointerMove"
-    @pointerleave="handlePointerLeave"
-  >
+  <div ref="containerRef" class="fluid-glass">
     <div ref="stageRef" class="fluid-glass-stage"></div>
-    <div class="fluid-glass-scroll-spacer" aria-hidden="true"></div>
-
-    <div v-if="isBarMode" class="fluid-glass-nav">
-      <button
-        v-for="item in navItems"
-        :key="item.label"
-        type="button"
-        class="fluid-glass-nav-item"
-        @click="handleNavClick(item.link)"
-      >
-        {{ item.label }}
-      </button>
-    </div>
+    <div class="fluid-glass-scroll" aria-hidden="true"></div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, useTemplateRef, watch } from 'vue';
+import { onBeforeUnmount, onMounted, useTemplateRef, watch } from 'vue';
 import * as THREE from 'three';
-import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
+
+import cs1 from '@/assets/demo/cs1.webp';
+import cs2 from '@/assets/demo/cs2.webp';
+import cs3 from '@/assets/demo/cs3.webp';
 
 type Mode = 'lens' | 'bar' | 'cube';
 
@@ -34,64 +22,41 @@ interface NavItem {
   link: string;
 }
 
-interface SharedModeProps {
+interface ModeProps {
   scale?: number;
   ior?: number;
   thickness?: number;
-  transmission?: number;
-  roughness?: number;
   anisotropy?: number;
   chromaticAberration?: number;
+  transmission?: number;
+  roughness?: number;
   color?: string;
   attenuationColor?: string;
   attenuationDistance?: number;
-}
-
-type LensProps = SharedModeProps;
-type CubeProps = SharedModeProps;
-
-interface BarProps extends SharedModeProps {
   navItems?: NavItem[];
 }
 
 interface FluidGlassProps {
   mode?: Mode;
-  images?: string[];
-  title?: string;
-  lensProps?: LensProps;
-  barProps?: BarProps;
-  cubeProps?: CubeProps;
-  className?: string;
-  text?: string;
+  lensProps?: ModeProps;
+  barProps?: ModeProps;
+  cubeProps?: ModeProps;
 }
 
 const props = withDefaults(defineProps<FluidGlassProps>(), {
   mode: 'lens',
-  images: () => [
-    '/assets/demo/cs1.webp',
-    '/assets/demo/cs2.webp',
-    '/assets/demo/cs3.webp',
-    '/assets/demo/cs1.webp',
-    '/assets/demo/cs2.webp'
-  ],
-  title: 'Vue Bits',
   lensProps: () => ({}),
   barProps: () => ({}),
-  cubeProps: () => ({}),
-  className: ''
+  cubeProps: () => ({})
 });
 
-const DEFAULT_NAV_ITEMS: NavItem[] = [
+const DEFAULT_NAV: NavItem[] = [
   { label: 'Home', link: '' },
   { label: 'About', link: '' },
   { label: 'Contact', link: '' }
 ];
 
-const BAR_DEFAULTS: Required<Pick<SharedModeProps, 'transmission' | 'roughness' | 'thickness' | 'ior'>> & {
-  color: string;
-  attenuationColor: string;
-  attenuationDistance: number;
-} = {
+const BAR_DEFAULTS: ModeProps = {
   transmission: 1,
   roughness: 0,
   thickness: 10,
@@ -101,496 +66,754 @@ const BAR_DEFAULTS: Required<Pick<SharedModeProps, 'transmission' | 'roughness' 
   attenuationDistance: 0.25
 };
 
-const isBarMode = computed(() => props.mode === 'bar');
-const navItems = computed(() => props.barProps?.navItems ?? DEFAULT_NAV_ITEMS);
+const MODE_CONFIG: Record<Mode, { url: string; geometryKey: string; followPointer: boolean; lockToBottom: boolean }> = {
+  lens: { url: '/assets/3d/lens.glb', geometryKey: 'Cylinder', followPointer: true, lockToBottom: false },
+  cube: { url: '/assets/3d/cube.glb', geometryKey: 'Cube', followPointer: true, lockToBottom: false },
+  bar: { url: '/assets/3d/bar.glb', geometryKey: 'Cube', followPointer: false, lockToBottom: true }
+};
+
+const SHARED_IMAGES = [cs1, cs2, cs3, cs1, cs2];
+const PAGES = 3;
+
+// ============================================================================
+// GlassMaterial — a ShaderMaterial that samples an FBO texture to produce
+// a refraction + chromatic-aberration glass effect without relying on
+// Three.js's internal transmission machinery (which differs across versions).
+// ============================================================================
+
+interface GlassMaterialParams {
+  buffer: THREE.Texture;
+  ior?: number;
+  thickness?: number;
+  transmission?: number;
+  roughness?: number;
+  color?: string;
+  attenuationColor?: string;
+  attenuationDistance?: number;
+  chromaticAberration?: number;
+  anisotropy?: number;
+}
+
+function makeGlassMaterial(params: GlassMaterialParams): THREE.ShaderMaterial {
+  const ior = params.ior ?? 1.15;
+  const thickness = params.thickness ?? 5;
+  const ca = params.chromaticAberration ?? 0.1;
+  const tint = new THREE.Color(params.color ?? '#ffffff');
+  const attenuationColor = new THREE.Color(params.attenuationColor ?? '#ffffff');
+  const attenuationDistance = params.attenuationDistance ?? Infinity;
+
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      fboBuffer: { value: params.buffer },
+      ior: { value: ior },
+      thickness: { value: thickness },
+      chromaticAberration: { value: ca },
+      tint: { value: tint },
+      attenuationColor: { value: attenuationColor },
+      attenuationDistance: { value: attenuationDistance },
+      uProjectionMatrix: { value: new THREE.Matrix4() }
+    },
+    vertexShader: /* glsl */ `
+      varying vec3 vNormal;
+      varying vec3 vWorldPos;
+      varying float vModelScale;
+      void main() {
+        vec4 worldPos = modelMatrix * vec4(position, 1.0);
+        vWorldPos = worldPos.xyz;
+        vNormal = normalize(mat3(modelMatrix) * normal);
+        vModelScale = length(modelMatrix[0].xyz);
+        gl_Position = projectionMatrix * viewMatrix * worldPos;
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      uniform sampler2D fboBuffer;
+      uniform float ior;
+      uniform float thickness;
+      uniform float chromaticAberration;
+      uniform vec3 tint;
+      uniform vec3 attenuationColor;
+      uniform float attenuationDistance;
+      uniform mat4 uProjectionMatrix;
+
+      varying vec3 vNormal;
+      varying vec3 vWorldPos;
+      varying float vModelScale;
+
+      vec2 refractionUV(vec3 n, float iorVal, float dist) {
+        vec3 v = normalize(cameraPosition - vWorldPos);
+        vec3 refr = refract(-v, n, 1.0 / iorVal);
+        vec4 refractedClip = uProjectionMatrix * viewMatrix * vec4(vWorldPos + refr * dist, 1.0);
+        vec2 refractedUV = (refractedClip.xy / refractedClip.w) * 0.5 + 0.5;
+        return clamp(refractedUV, 0.0, 1.0);
+      }
+
+      void main() {
+        vec3 n = normalize(vNormal);
+        // match drei: refraction ray length = thickness * model scale
+        float dist = thickness * vModelScale;
+
+        // chromatic aberration: 3 IOR-shifted samples
+        float iorR = ior;
+        float iorG = ior * (1.0 + chromaticAberration * 0.5);
+        float iorB = ior * (1.0 + chromaticAberration * 1.0);
+
+        vec2 uvR = refractionUV(n, iorR, dist);
+        vec2 uvG = refractionUV(n, iorG, dist);
+        vec2 uvB = refractionUV(n, iorB, dist);
+
+        float r = texture2D(fboBuffer, uvR).r;
+        float g = texture2D(fboBuffer, uvG).g;
+        float b = texture2D(fboBuffer, uvB).b;
+
+        vec3 refracted = vec3(r, g, b);
+
+        // volume attenuation
+        if (attenuationDistance < 1e9) {
+          vec3 coeff = -log(max(attenuationColor, vec3(0.001))) / attenuationDistance;
+          refracted *= exp(-coeff * dist);
+        }
+
+        // subtle Fresnel rim for glassy look
+        vec3 v = normalize(cameraPosition - vWorldPos);
+        float fresnel = pow(1.0 - max(dot(n, v), 0.0), 3.0);
+        vec3 color = mix(refracted * tint, vec3(1.0), fresnel * 0.15);
+
+        gl_FragColor = vec4(color, 0.92);
+      }
+    `,
+    transparent: true,
+    side: THREE.FrontSide,
+    depthWrite: false
+  });
+}
+
+// ============================================================================
+// ImageMaterial — replicates @react-three/drei <Image> cover + zoom behavior
+// ============================================================================
+
+class ImageMaterial extends THREE.ShaderMaterial {
+  constructor(texture: THREE.Texture, imageAspect: number) {
+    super({
+      uniforms: {
+        map: { value: texture },
+        zoom: { value: 1 },
+        scale: { value: new THREE.Vector2(1, 1) },
+        imageAspect: { value: imageAspect },
+        opacity: { value: 1 }
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform sampler2D map;
+        uniform float zoom;
+        uniform vec2 scale;
+        uniform float imageAspect;
+        uniform float opacity;
+        varying vec2 vUv;
+        void main() {
+          vec2 s = scale;
+          float rs = s.x / s.y;
+          float ri = imageAspect;
+          vec2 newSize = rs < ri ? vec2(s.y * ri, s.y) : vec2(s.x, s.x / ri);
+          vec2 offset = (rs < ri
+            ? vec2((newSize.x - s.x) / 2.0, 0.0)
+            : vec2(0.0, (newSize.y - s.y) / 2.0)) / newSize;
+          vec2 uv = vUv * s / newSize + offset;
+          vec2 zUv = (uv - vec2(0.5)) / zoom + vec2(0.5);
+          gl_FragColor = vec4(texture2D(map, zUv).rgb, opacity);
+        }
+      `,
+      transparent: true
+    });
+  }
+}
+
+// ============================================================================
+// Component state
+// ============================================================================
 
 const containerRef = useTemplateRef<HTMLDivElement>('containerRef');
 const stageRef = useTemplateRef<HTMLDivElement>('stageRef');
 
 let renderer: THREE.WebGLRenderer | null = null;
 let scene: THREE.Scene | null = null;
+let innerScene: THREE.Scene | null = null;
 let camera: THREE.PerspectiveCamera | null = null;
-let resizeObserver: ResizeObserver | null = null;
-let animationFrameId = 0;
-let imagePlanes: THREE.Mesh[] = [];
-let titleMesh: THREE.Mesh | null = null;
+let fbo: THREE.WebGLRenderTarget | null = null;
+let backgroundPlane: THREE.Mesh | null = null;
 let glassMesh: THREE.Mesh | null = null;
-let ambientLight: THREE.AmbientLight | null = null;
-let keyLight: THREE.DirectionalLight | null = null;
-let rimLight: THREE.PointLight | null = null;
-let currentTitleTexture: THREE.CanvasTexture | null = null;
+let scrollGroup: THREE.Group | null = null;
+let navGroup: THREE.Group | null = null;
+let typographyMesh: THREE.Mesh | null = null;
+let typographyTexture: THREE.CanvasTexture | null = null;
+let imageEntries: Array<{ mesh: THREE.Mesh; material: ImageMaterial }> = [];
+let navTextures: THREE.CanvasTexture[] = [];
 
+let animFrameId = 0;
+let resizeObserver: ResizeObserver | null = null;
 const pointer = { x: 0, y: 0 };
-const objectPosition = { x: 0, y: 0 };
+const glassPos = { x: 0, y: 0 };
 let scrollTarget = 0;
 let scrollCurrent = 0;
+let lastTime = 0;
+let glassMeshLoadToken = 0;
 
+const gltfLoader = new GLTFLoader();
+const dracoLoader = new DRACOLoader();
+dracoLoader.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.7/');
+gltfLoader.setDRACOLoader(dracoLoader);
 const textureLoader = new THREE.TextureLoader();
-const DEFAULT_IMAGE_COUNT = 5;
 
-const resolveModeProps = (): SharedModeProps | BarProps => {
-  if (props.mode === 'bar') {
-    return { ...BAR_DEFAULTS, ...props.barProps };
-  }
-  if (props.mode === 'cube') {
-    return props.cubeProps;
-  }
-  return props.lensProps;
-};
+// ============================================================================
+// Helpers
+// ============================================================================
 
-const getVisibleSizeAtZ = (zWorld: number) => {
-  if (!camera) {
-    return { width: 1, height: 1 };
-  }
-
-  const distance = Math.abs(camera.position.z - zWorld);
+const getViewportAtZ = (z: number) => {
+  if (!camera) return { width: 1, height: 1 };
+  const distance = Math.abs(camera.position.z - z);
   const vFov = THREE.MathUtils.degToRad(camera.fov);
   const height = 2 * Math.tan(vFov / 2) * distance;
-
-  return {
-    width: height * camera.aspect,
-    height
-  };
+  return { width: height * camera.aspect, height };
 };
 
-const createTitleTexture = (text: string) => {
-  const canvas = document.createElement('canvas');
-  const context = canvas.getContext('2d');
-  if (!context) return null;
+const getDevice = () => {
+  const w = containerRef.value?.clientWidth ?? window.innerWidth;
+  if (w <= 639) return 'mobile';
+  if (w <= 1023) return 'tablet';
+  return 'desktop';
+};
 
+const resolveModeProps = (): ModeProps => {
+  if (props.mode === 'bar') return { ...BAR_DEFAULTS, ...props.barProps };
+  if (props.mode === 'cube') return { ...props.cubeProps };
+  return { ...props.lensProps };
+};
+
+const createTextTexture = (text: string, fontSizePx = 260, weight = 700) => {
+  const canvas = document.createElement('canvas');
   canvas.width = 2048;
   canvas.height = 512;
-
-  context.clearRect(0, 0, canvas.width, canvas.height);
-  context.font = '700 260px Inter, Arial, sans-serif';
-  context.textAlign = 'center';
-  context.textBaseline = 'middle';
-
-  context.shadowColor = 'rgba(0, 0, 0, 0.35)';
-  context.shadowBlur = 48;
-  context.fillStyle = '#ffffff';
-  context.fillText(text, canvas.width / 2, canvas.height / 2);
-
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.colorSpace = THREE.SRGBColorSpace;
-  texture.needsUpdate = true;
-
-  return texture;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return { texture: new THREE.CanvasTexture(canvas), aspect: 1 };
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.font = `${weight} ${fontSizePx}px Inter, "Helvetica Neue", Arial, sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.shadowColor = 'rgba(0, 0, 0, 0.5)';
+  ctx.shadowBlur = fontSizePx * 0.35;
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.needsUpdate = true;
+  const metrics = ctx.measureText(text);
+  const textWidthPx = metrics.width + fontSizePx * 0.5;
+  const aspect = textWidthPx / fontSizePx;
+  return { texture: tex, aspect };
 };
 
-const createImagePlane = (asset: string) => {
-  const texture = textureLoader.load(asset);
-  texture.colorSpace = THREE.SRGBColorSpace;
-
-  const geometry = new THREE.PlaneGeometry(1, 1, 1, 1);
-  const material = new THREE.MeshBasicMaterial({
-    map: texture
+const loadImagePlane = (url: string) =>
+  new Promise<{ mesh: THREE.Mesh; material: ImageMaterial }>((resolve, reject) => {
+    textureLoader.load(
+      url,
+      tex => {
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.minFilter = THREE.LinearMipmapLinearFilter;
+        tex.magFilter = THREE.LinearFilter;
+        tex.generateMipmaps = true;
+        const aspect = tex.image.width / tex.image.height;
+        const material = new ImageMaterial(tex, aspect);
+        const mesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), material);
+        resolve({ mesh, material });
+      },
+      undefined,
+      reject
+    );
   });
 
-  return new THREE.Mesh(geometry, material);
-};
+// ============================================================================
+// Builders
+// ============================================================================
 
-const rebuildTitle = () => {
-  if (!scene) return;
-
-  if (titleMesh) {
-    scene.remove(titleMesh);
-    titleMesh.geometry.dispose();
-    (titleMesh.material as THREE.MeshBasicMaterial).dispose();
-    titleMesh = null;
+const buildTypography = () => {
+  if (!innerScene || !scrollGroup) return;
+  if (typographyMesh) {
+    scrollGroup.remove(typographyMesh);
+    typographyMesh.geometry.dispose();
+    (typographyMesh.material as THREE.MeshBasicMaterial).dispose();
+    typographyMesh = null;
+  }
+  if (typographyTexture) {
+    typographyTexture.dispose();
+    typographyTexture = null;
   }
 
-  if (currentTitleTexture) {
-    currentTitleTexture.dispose();
-    currentTitleTexture = null;
-  }
+  const device = getDevice();
+  const fontSize = device === 'mobile' ? 0.2 : device === 'tablet' ? 0.4 : 0.6;
+  const { texture, aspect } = createTextTexture('Vue Bits');
+  typographyTexture = texture;
 
-  currentTitleTexture = createTitleTexture(props.title ?? 'Vue Bits');
-  if (!currentTitleTexture) return;
-
-  titleMesh = new THREE.Mesh(
-    new THREE.PlaneGeometry(1, 0.25),
-    new THREE.MeshBasicMaterial({
-      map: currentTitleTexture,
-      transparent: true
-    })
+  const planeH = fontSize * 1.4;
+  const planeW = planeH * aspect;
+  typographyMesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(planeW, planeH),
+    new THREE.MeshBasicMaterial({ map: texture, transparent: true, depthWrite: false })
   );
-
-  titleMesh.renderOrder = 5;
-  scene.add(titleMesh);
+  typographyMesh.position.set(0, 0, 12);
+  scrollGroup.add(typographyMesh);
 };
 
-const rebuildGlassMesh = () => {
+const buildImages = async () => {
+  if (!innerScene || !scrollGroup) return;
+  imageEntries.forEach(e => {
+    scrollGroup?.remove(e.mesh);
+    e.mesh.geometry.dispose();
+    (e.material.uniforms.map.value as THREE.Texture)?.dispose();
+    e.material.dispose();
+  });
+  imageEntries = [];
+
+  const height = getViewportAtZ(0).height;
+  const layout: Array<{ url: string; pos: [number, number, number]; scale: [number, number] }> = [
+    { url: SHARED_IMAGES[0], pos: [-2, 0, 0], scale: [3, height / 1.1] },
+    { url: SHARED_IMAGES[1], pos: [2, 0, 3], scale: [3, 3] },
+    { url: SHARED_IMAGES[2], pos: [-2.05, -height, 6], scale: [1, 3] },
+    { url: SHARED_IMAGES[3], pos: [-0.6, -height, 9], scale: [1, 2] },
+    { url: SHARED_IMAGES[4], pos: [0.75, -height, 10.5], scale: [1.5, 1.5] }
+  ];
+
+  for (const item of layout) {
+    try {
+      const { mesh, material } = await loadImagePlane(item.url);
+      mesh.position.set(item.pos[0], item.pos[1], item.pos[2]);
+      mesh.scale.set(item.scale[0], item.scale[1], 1);
+      (material.uniforms.scale.value as THREE.Vector2).set(item.scale[0], item.scale[1]);
+      scrollGroup.add(mesh);
+      imageEntries.push({ mesh, material });
+    } catch (err) {
+      console.warn('[FluidGlass] failed to load image', item.url, err);
+    }
+  }
+};
+
+const buildNavItems = () => {
   if (!scene) return;
+  if (navGroup) {
+    scene.remove(navGroup);
+    navGroup.children.forEach(c => {
+      const m = c as THREE.Mesh;
+      m.geometry.dispose();
+      (m.material as THREE.Material).dispose();
+    });
+    navGroup = null;
+  }
+  navTextures.forEach(t => t.dispose());
+  navTextures = [];
+
+  if (props.mode !== 'bar') return;
+
+  const items = (props.barProps?.navItems as NavItem[] | undefined) ?? DEFAULT_NAV;
+  const device = getDevice();
+  const config = {
+    mobile: { spacing: 0.2, fontSize: 0.035 },
+    tablet: { spacing: 0.24, fontSize: 0.045 },
+    desktop: { spacing: 0.3, fontSize: 0.045 }
+  }[device];
+
+  navGroup = new THREE.Group();
+  navGroup.renderOrder = 10;
+
+  items.forEach((item, i) => {
+    const { texture, aspect } = createTextTexture(item.label, 140);
+    navTextures.push(texture);
+    const planeH = config.fontSize * 1.8;
+    const planeW = planeH * aspect;
+    const mesh = new THREE.Mesh(
+      new THREE.PlaneGeometry(planeW, planeH),
+      new THREE.MeshBasicMaterial({
+        map: texture,
+        transparent: true,
+        depthWrite: false,
+        depthTest: false
+      })
+    );
+    mesh.renderOrder = 10;
+    mesh.position.x = (i - (items.length - 1) / 2) * config.spacing;
+    mesh.userData.link = item.link;
+    navGroup!.add(mesh);
+  });
+
+  scene.add(navGroup);
+};
+
+const extractGeometry = (root: THREE.Object3D, geometryKey: string): THREE.BufferGeometry | null => {
+  const named = root.getObjectByName(geometryKey) as THREE.Mesh | undefined;
+  if (named && (named as THREE.Mesh).isMesh && named.geometry) {
+    return named.geometry;
+  }
+  let geo: THREE.BufferGeometry | null = null;
+  root.traverse(obj => {
+    if (!geo && (obj as THREE.Mesh).isMesh) {
+      geo = (obj as THREE.Mesh).geometry;
+    }
+  });
+  return geo;
+};
+
+const applyMaterialProps = () => {
+  if (!glassMesh || !fbo) return;
+  const isBar = props.mode === 'bar';
+  const modeProps = resolveModeProps();
+  const mat = glassMesh.material as THREE.ShaderMaterial;
+
+  mat.uniforms.ior.value = modeProps.ior ?? 1.15;
+  mat.uniforms.thickness.value = modeProps.thickness ?? 5;
+  mat.uniforms.chromaticAberration.value = modeProps.chromaticAberration ?? 0.1;
+  (mat.uniforms.tint.value as THREE.Color).set(modeProps.color ?? '#ffffff');
+  (mat.uniforms.attenuationColor.value as THREE.Color).set(modeProps.attenuationColor ?? '#ffffff');
+  mat.uniforms.attenuationDistance.value = modeProps.attenuationDistance ?? (isBar ? 0.25 : Infinity);
+
+  if (modeProps.scale != null) {
+    glassMesh.scale.setScalar(modeProps.scale);
+  }
+};
+
+const buildGlassMesh = async () => {
+  if (!scene || !fbo) return;
+  const token = ++glassMeshLoadToken;
 
   if (glassMesh) {
     scene.remove(glassMesh);
     glassMesh.geometry.dispose();
-    (glassMesh.material as THREE.MeshPhysicalMaterial).dispose();
+    (glassMesh.material as THREE.Material).dispose();
     glassMesh = null;
   }
 
-  let geometry: THREE.BufferGeometry;
-  if (props.mode === 'lens') {
-    geometry = new THREE.CylinderGeometry(0.62, 0.62, 0.28, 96, 1, false);
-  } else if (props.mode === 'bar') {
-    geometry = new RoundedBoxGeometry(1.12, 0.24, 0.64, 8, 0.12);
-  } else {
-    geometry = new RoundedBoxGeometry(0.82, 0.82, 0.82, 6, 0.16);
+  const config = MODE_CONFIG[props.mode];
+  const isBar = props.mode === 'bar';
+  const modeProps = resolveModeProps();
+
+  let geometry: THREE.BufferGeometry | null = null;
+  try {
+    const gltf = await gltfLoader.loadAsync(config.url);
+    geometry = extractGeometry(gltf.scene, config.geometryKey);
+  } catch (err) {
+    console.warn('[FluidGlass] failed to load model', config.url, err);
+  }
+  if (token !== glassMeshLoadToken || !scene) return;
+  if (!geometry) return;
+
+  geometry.computeBoundingBox();
+
+  const material = makeGlassMaterial({
+    buffer: fbo.texture,
+    ior: modeProps.ior ?? 1.15,
+    thickness: modeProps.thickness ?? 5,
+    color: modeProps.color ?? '#ffffff',
+    attenuationColor: modeProps.attenuationColor ?? '#ffffff',
+    attenuationDistance: modeProps.attenuationDistance ?? (isBar ? 0.25 : Infinity),
+    chromaticAberration: modeProps.chromaticAberration ?? 0.1
+  });
+  if (camera) {
+    material.uniforms.uProjectionMatrix.value = camera.projectionMatrix;
   }
 
-  glassMesh = new THREE.Mesh(
-    geometry,
-    new THREE.MeshPhysicalMaterial({
-      color: '#ffffff',
-      roughness: 0,
-      transmission: 1,
-      thickness: props.mode === 'bar' ? 10 : 2,
-      ior: 1.15,
-      attenuationColor: '#ffffff',
-      attenuationDistance: props.mode === 'bar' ? 0.25 : 0.8,
-      transparent: true,
-      metalness: 0,
-      reflectivity: 0.45,
-      clearcoat: 1,
-      clearcoatRoughness: 0.05,
-      iridescence: 0.3,
-      envMapIntensity: 1.2
-    })
-  );
-
+  glassMesh = new THREE.Mesh(geometry, material);
   glassMesh.rotation.x = Math.PI / 2;
-  glassMesh.position.z = 15;
+  glassMesh.position.set(0, 0, 15);
+  glassMesh.scale.setScalar(modeProps.scale ?? 0.15);
   scene.add(glassMesh);
 };
 
-const updateLayout = () => {
-  if (!camera || !titleMesh) return;
+// ============================================================================
+// Lifecycle
+// ============================================================================
 
-  const backgroundViewport = getVisibleSizeAtZ(0);
-  const titleViewport = getVisibleSizeAtZ(12);
+const resize = () => {
+  if (!renderer || !camera || !containerRef.value || !fbo) return;
+  const w = containerRef.value.clientWidth;
+  const h = containerRef.value.clientHeight;
+  if (!w || !h) return;
 
-  const layout = [
-    {
-      x: -backgroundViewport.width * 0.28,
-      y: backgroundViewport.height * 0.12,
-      z: 0,
-      width: backgroundViewport.width * 0.38,
-      height: backgroundViewport.height * 0.9
-    },
-    {
-      x: backgroundViewport.width * 0.28,
-      y: backgroundViewport.height * 0.08,
-      z: 3,
-      width: backgroundViewport.width * 0.24,
-      height: backgroundViewport.width * 0.24
-    },
-    {
-      x: -backgroundViewport.width * 0.29,
-      y: -backgroundViewport.height * 0.92,
-      z: 6,
-      width: backgroundViewport.width * 0.13,
-      height: backgroundViewport.height * 0.42
-    },
-    {
-      x: -backgroundViewport.width * 0.1,
-      y: -backgroundViewport.height * 0.92,
-      z: 9,
-      width: backgroundViewport.width * 0.13,
-      height: backgroundViewport.height * 0.3
-    },
-    {
-      x: backgroundViewport.width * 0.14,
-      y: -backgroundViewport.height * 0.92,
-      z: 10.5,
-      width: backgroundViewport.width * 0.19,
-      height: backgroundViewport.width * 0.19
-    }
-  ];
-
-  imagePlanes.forEach((plane, index) => {
-    const item = layout[index];
-    plane.position.set(item.x, item.y, item.z);
-    plane.scale.set(item.width, item.height, 1);
-    plane.userData.baseScale = { width: item.width, height: item.height };
-  });
-
-  titleMesh.position.set(0, backgroundViewport.height * 0.16, 12);
-  titleMesh.scale.set(titleViewport.width * 0.62, titleViewport.width * 0.155, 1);
-};
-
-const applyRendererSize = () => {
-  if (!renderer || !camera || !containerRef.value) return;
-
-  const width = containerRef.value.clientWidth;
-  const height = containerRef.value.clientHeight;
-  if (width === 0 || height === 0) return;
-
-  renderer.setSize(width, height, false);
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-
-  camera.aspect = width / height;
+  const pr = Math.min(window.devicePixelRatio, 2);
+  renderer.setSize(w, h, false);
+  renderer.setPixelRatio(pr);
+  camera.aspect = w / h;
   camera.updateProjectionMatrix();
+  fbo.setSize(Math.floor(w * pr), Math.floor(h * pr));
 
-  rebuildTitle();
-  updateLayout();
-};
-
-const applyMaterialProps = () => {
-  if (!glassMesh) return;
-
-  const modeProps = resolveModeProps();
-  const material = glassMesh.material as THREE.MeshPhysicalMaterial;
-  const isBar = props.mode === 'bar';
-  const normalizedScale = (modeProps.scale ?? 0.25) * 4;
-  const chromaticAberration = modeProps.chromaticAberration ?? (isBar ? 0 : 0.05);
-
-  material.ior = modeProps.ior ?? 1.15;
-  material.thickness = modeProps.thickness ?? (isBar ? 10 : 2);
-  material.transmission = modeProps.transmission ?? 1;
-  material.roughness = modeProps.roughness ?? 0;
-  material.color.set(modeProps.color ?? '#ffffff');
-  material.attenuationColor = new THREE.Color(modeProps.attenuationColor ?? '#ffffff');
-  material.attenuationDistance = modeProps.attenuationDistance ?? (isBar ? 0.25 : 0.8);
-  material.iridescence = THREE.MathUtils.clamp(chromaticAberration * 5, 0, 1);
-  material.iridescenceIOR = THREE.MathUtils.clamp((modeProps.anisotropy ?? 0.01) * 40 + 1, 1, 2.333);
-  material.clearcoatRoughness = THREE.MathUtils.clamp((modeProps.anisotropy ?? 0.01) * 4, 0, 1);
-  if (isBar) {
-    glassMesh.scale.set(1, 1, 1);
-  } else {
-    glassMesh.scale.setScalar(normalizedScale);
-  }
-};
-
-const updateScene = () => {
-  if (!glassMesh || !camera || !titleMesh) return;
-
-  const objectViewport = getVisibleSizeAtZ(15);
-  const backgroundViewport = getVisibleSizeAtZ(0);
-
-  scrollCurrent += (scrollTarget - scrollCurrent) * 0.08;
-  objectPosition.x += (pointer.x - objectPosition.x) * 0.12;
-  objectPosition.y += (pointer.y - objectPosition.y) * 0.12;
-
-  imagePlanes.forEach((plane, index) => {
-    const baseScale = plane.userData.baseScale as { width: number; height: number };
-    const zoom =
-      index <= 1
-        ? 1 + Math.min(scrollCurrent / (1 / 3), 1) / 3
-        : 1 + Math.min(Math.max((scrollCurrent - 1.15 / 3) / (1 / 3), 0), 1) / 2;
-
-    plane.scale.set(baseScale.width * zoom, baseScale.height * zoom, 1);
-    plane.rotation.z = index === 1 || index === 4 ? -0.06 : 0;
-  });
-
-  const scrollTravel = backgroundViewport.height * 1.22;
-
-  if (titleMesh) {
-    titleMesh.position.y = backgroundViewport.height * 0.16 - scrollCurrent * scrollTravel;
+  if (backgroundPlane) {
+    const vp = getViewportAtZ(0);
+    backgroundPlane.scale.set(vp.width, vp.height, 1);
   }
 
-  imagePlanes.forEach((plane, index) => {
-    if (index === 0) plane.position.y = backgroundViewport.height * 0.12 - scrollCurrent * scrollTravel;
-    if (index === 1) plane.position.y = backgroundViewport.height * 0.08 - scrollCurrent * scrollTravel;
-    if (index === 2) plane.position.y = -backgroundViewport.height * 0.92 - scrollCurrent * scrollTravel;
-    if (index === 3) plane.position.y = -backgroundViewport.height * 0.92 - scrollCurrent * scrollTravel;
-    if (index === 4) plane.position.y = -backgroundViewport.height * 0.92 - scrollCurrent * scrollTravel;
-  });
-
-  if (props.mode === 'bar') {
-    glassMesh.position.x = 0;
-    glassMesh.position.y = -objectViewport.height / 2 + 0.2;
-  } else {
-    glassMesh.position.x = (objectPosition.x * objectViewport.width) / 2;
-    glassMesh.position.y = (objectPosition.y * objectViewport.height) / 2;
-  }
-
-  glassMesh.rotation.y += props.mode === 'cube' ? 0.01 : 0.004;
-  glassMesh.rotation.z = props.mode === 'cube' ? Math.sin(performance.now() * 0.0012) * 0.12 : 0;
+  buildTypography();
+  buildImages();
+  buildNavItems();
 };
 
-const animate = () => {
-  animationFrameId = requestAnimationFrame(animate);
-
-  if (!renderer || !scene || !camera) return;
-
-  updateScene();
-  renderer.render(scene, camera);
-};
-
-const handlePointerMove = (event: PointerEvent) => {
-  if (!containerRef.value || props.mode === 'bar') return;
-
+const onPointerMove = (e: PointerEvent) => {
+  if (!containerRef.value) return;
   const rect = containerRef.value.getBoundingClientRect();
-  pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-  pointer.y = -(((event.clientY - rect.top) / rect.height) * 2 - 1);
+  pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  pointer.y = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
 };
 
-const handlePointerLeave = () => {
+const onPointerLeave = () => {
   pointer.x = 0;
   pointer.y = 0;
 };
 
-const handleNavClick = (link: string) => {
-  if (!link) return;
-
-  if (link.startsWith('#')) {
-    window.location.hash = link;
-    return;
-  }
-
-  window.location.href = link;
-};
-
 const onScroll = () => {
   if (!containerRef.value) return;
-
-  const maxScroll = containerRef.value.scrollHeight - containerRef.value.clientHeight;
-  scrollTarget = maxScroll > 0 ? containerRef.value.scrollTop / maxScroll : 0;
+  const max = containerRef.value.scrollHeight - containerRef.value.clientHeight;
+  scrollTarget = max > 0 ? containerRef.value.scrollTop / max : 0;
 };
 
-const initializeScene = () => {
+const onClick = (e: MouseEvent) => {
+  if (props.mode !== 'bar' || !navGroup || !camera || !containerRef.value) return;
+  const rect = containerRef.value.getBoundingClientRect();
+  const ndc = new THREE.Vector2(
+    ((e.clientX - rect.left) / rect.width) * 2 - 1,
+    -(((e.clientY - rect.top) / rect.height) * 2 - 1)
+  );
+  const raycaster = new THREE.Raycaster();
+  raycaster.setFromCamera(ndc, camera);
+  const hits = raycaster.intersectObjects(navGroup.children, false);
+  if (hits.length === 0) return;
+  const link = hits[0].object.userData.link as string;
+  if (!link) return;
+  if (link.startsWith('#')) window.location.hash = link;
+  else window.location.href = link;
+};
+
+const animate = () => {
+  animFrameId = requestAnimationFrame(animate);
+  if (!renderer || !scene || !innerScene || !camera || !fbo) return;
+
+  const now = performance.now();
+  const dt = lastTime === 0 ? 0.016 : Math.min((now - lastTime) / 1000, 0.05);
+  lastTime = now;
+
+  const scrollDamp = 1 - Math.exp(-dt / 0.2);
+  scrollCurrent += (scrollTarget - scrollCurrent) * scrollDamp;
+
+  if (scrollGroup) {
+    const vp0 = getViewportAtZ(0);
+    scrollGroup.position.y = scrollCurrent * (PAGES - 1) * vp0.height;
+  }
+
+  if (imageEntries.length >= 5) {
+    const r1 = THREE.MathUtils.clamp(scrollCurrent / (1 / 3), 0, 1);
+    const r2 = THREE.MathUtils.clamp((scrollCurrent - 1.15 / 3) / (1 / 3), 0, 1);
+    (imageEntries[0].material.uniforms.zoom.value as number) = 1 + r1 / 3;
+    (imageEntries[1].material.uniforms.zoom.value as number) = 1 + r1 / 3;
+    (imageEntries[2].material.uniforms.zoom.value as number) = 1 + r2 / 2;
+    (imageEntries[3].material.uniforms.zoom.value as number) = 1 + r2 / 2;
+    (imageEntries[4].material.uniforms.zoom.value as number) = 1 + r2 / 2;
+  }
+
+  if (glassMesh) {
+    const config = MODE_CONFIG[props.mode];
+    const vp15 = getViewportAtZ(15);
+    const destX = config.followPointer ? (pointer.x * vp15.width) / 2 : 0;
+    const destY = config.lockToBottom
+      ? -vp15.height / 2 + 0.2
+      : config.followPointer
+        ? (pointer.y * vp15.height) / 2
+        : 0;
+    const posDamp = 1 - Math.exp(-dt / 0.15);
+    glassPos.x += (destX - glassPos.x) * posDamp;
+    glassPos.y += (destY - glassPos.y) * posDamp;
+    glassMesh.position.set(glassPos.x, glassPos.y, 15);
+
+    const modeProps = resolveModeProps();
+    if (modeProps.scale == null && glassMesh.geometry.boundingBox) {
+      const bbox = glassMesh.geometry.boundingBox;
+      const geoWidth = bbox.max.x - bbox.min.x || 1;
+      const maxWorld = vp15.width * 0.9;
+      const desired = maxWorld / geoWidth;
+      glassMesh.scale.setScalar(Math.min(0.15, desired));
+    }
+
+  }
+
+  if (navGroup) {
+    const vp15 = getViewportAtZ(15);
+    navGroup.position.set(0, -vp15.height / 2 + 0.2, 15.1);
+  }
+
+  // 1. Render inner scene to FBO — this becomes the fboBuffer sampled by glass material
+  renderer.setRenderTarget(fbo);
+  renderer.setClearColor(0x5227ff, 1);
+  renderer.clear();
+  renderer.render(innerScene, camera);
+
+  // 2. Render main scene (background plane + glass mesh) to screen
+  renderer.setRenderTarget(null);
+  renderer.setClearColor(0x5227ff, 1);
+  renderer.clear();
+  renderer.render(scene, camera);
+};
+
+const init = async () => {
   if (!stageRef.value || !containerRef.value) return;
 
-  renderer = new THREE.WebGLRenderer({
-    antialias: true,
-    alpha: true
-  });
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
   renderer.outputColorSpace = THREE.SRGBColorSpace;
-  renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.1;
-  renderer.setClearColor(0x5227ff, 1);
+  renderer.toneMapping = THREE.NoToneMapping;
   stageRef.value.appendChild(renderer.domElement);
 
-  scene = new THREE.Scene();
+  const w = containerRef.value.clientWidth;
+  const h = containerRef.value.clientHeight;
+  const pr = Math.min(window.devicePixelRatio, 2);
+  renderer.setSize(w, h, false);
+  renderer.setPixelRatio(pr);
 
-  camera = new THREE.PerspectiveCamera(15, 1, 0.1, 100);
+  camera = new THREE.PerspectiveCamera(15, w / Math.max(1, h), 0.1, 100);
   camera.position.set(0, 0, 20);
 
-  ambientLight = new THREE.AmbientLight('#ffffff', 2);
-  scene.add(ambientLight);
+  scene = new THREE.Scene();
+  innerScene = new THREE.Scene();
 
-  keyLight = new THREE.DirectionalLight('#ffffff', 3.5);
-  keyLight.position.set(2, 3, 8);
-  scene.add(keyLight);
-
-  rimLight = new THREE.PointLight('#9cc3ff', 14, 30);
-  rimLight.position.set(-3, 1.5, 12);
-  scene.add(rimLight);
-
-  imagePlanes = props.images.slice(0, DEFAULT_IMAGE_COUNT).map(createImagePlane);
-  imagePlanes.forEach(plane => scene?.add(plane));
-
-  rebuildTitle();
-  rebuildGlassMesh();
-  applyMaterialProps();
-  applyRendererSize();
-  onScroll();
-  animate();
-
-  resizeObserver = new ResizeObserver(() => {
-    applyRendererSize();
+  fbo = new THREE.WebGLRenderTarget(Math.floor(w * pr), Math.floor(h * pr), {
+    minFilter: THREE.LinearFilter,
+    magFilter: THREE.LinearFilter,
+    format: THREE.RGBAFormat,
+    type: THREE.UnsignedByteType,
+    colorSpace: THREE.SRGBColorSpace
   });
-  resizeObserver.observe(containerRef.value);
+
+  scene.add(new THREE.AmbientLight(0xffffff, 1.5));
+  const key = new THREE.DirectionalLight(0xffffff, 2.5);
+  key.position.set(2, 3, 8);
+  scene.add(key);
+
+  const vp0 = getViewportAtZ(0);
+  backgroundPlane = new THREE.Mesh(
+    new THREE.PlaneGeometry(1, 1),
+    new THREE.MeshBasicMaterial({ map: fbo.texture, toneMapped: false })
+  );
+  backgroundPlane.scale.set(vp0.width, vp0.height, 1);
+  backgroundPlane.position.set(0, 0, 0);
+  scene.add(backgroundPlane);
+
+  scrollGroup = new THREE.Group();
+  innerScene.add(scrollGroup);
+
+  buildTypography();
+  await buildImages();
+  await buildGlassMesh();
+  buildNavItems();
+
+  containerRef.value.addEventListener('pointermove', onPointerMove);
+  containerRef.value.addEventListener('pointerleave', onPointerLeave);
+  containerRef.value.addEventListener('click', onClick);
   containerRef.value.addEventListener('scroll', onScroll, { passive: true });
+  resizeObserver = new ResizeObserver(resize);
+  resizeObserver.observe(containerRef.value);
+
+  lastTime = 0;
+  animate();
 };
 
-const destroyScene = () => {
+const destroy = () => {
+  cancelAnimationFrame(animFrameId);
+  resizeObserver?.disconnect();
+  resizeObserver = null;
+
   if (containerRef.value) {
+    containerRef.value.removeEventListener('pointermove', onPointerMove);
+    containerRef.value.removeEventListener('pointerleave', onPointerLeave);
+    containerRef.value.removeEventListener('click', onClick);
     containerRef.value.removeEventListener('scroll', onScroll);
   }
 
-  if (resizeObserver) {
-    resizeObserver.disconnect();
-    resizeObserver = null;
-  }
-
-  cancelAnimationFrame(animationFrameId);
-
-  imagePlanes.forEach(plane => {
-    scene?.remove(plane);
-    plane.geometry.dispose();
-    const material = plane.material as THREE.MeshBasicMaterial;
-    material.map?.dispose();
-    material.dispose();
+  imageEntries.forEach(e => {
+    e.mesh.geometry.dispose();
+    (e.material.uniforms.map.value as THREE.Texture)?.dispose();
+    e.material.dispose();
   });
-  imagePlanes = [];
+  imageEntries = [];
 
-  if (titleMesh) {
-    scene?.remove(titleMesh);
-    titleMesh.geometry.dispose();
-    (titleMesh.material as THREE.MeshBasicMaterial).dispose();
-    titleMesh = null;
+  if (typographyMesh) {
+    typographyMesh.geometry.dispose();
+    (typographyMesh.material as THREE.MeshBasicMaterial).dispose();
+    typographyMesh = null;
   }
+  typographyTexture?.dispose();
+  typographyTexture = null;
 
-  currentTitleTexture?.dispose();
-  currentTitleTexture = null;
+  if (navGroup) {
+    navGroup.children.forEach(c => {
+      const m = c as THREE.Mesh;
+      m.geometry.dispose();
+      (m.material as THREE.Material).dispose();
+    });
+    navGroup = null;
+  }
+  navTextures.forEach(t => t.dispose());
+  navTextures = [];
 
   if (glassMesh) {
-    scene?.remove(glassMesh);
     glassMesh.geometry.dispose();
-    (glassMesh.material as THREE.MeshPhysicalMaterial).dispose();
+    (glassMesh.material as THREE.Material).dispose();
     glassMesh = null;
   }
+
+  if (backgroundPlane) {
+    backgroundPlane.geometry.dispose();
+    (backgroundPlane.material as THREE.Material).dispose();
+    backgroundPlane = null;
+  }
+
+  fbo?.dispose();
+  fbo = null;
+
+  dracoLoader.dispose();
 
   renderer?.dispose();
   if (renderer?.domElement.parentNode) {
     renderer.domElement.parentNode.removeChild(renderer.domElement);
   }
-
   renderer = null;
   scene = null;
+  innerScene = null;
   camera = null;
-  ambientLight = null;
-  keyLight = null;
-  rimLight = null;
+  scrollGroup = null;
 };
 
-watch(
-  () => [props.mode, props.lensProps, props.barProps, props.cubeProps],
-  () => {
-    rebuildGlassMesh();
-    applyMaterialProps();
-    applyRendererSize();
-  },
-  { deep: true }
-);
+onMounted(() => {
+  init();
+});
+
+onBeforeUnmount(() => {
+  destroy();
+});
 
 watch(
-  () => props.title,
+  () => props.mode,
   () => {
-    rebuildTitle();
-    applyRendererSize();
+    buildGlassMesh();
+    buildNavItems();
   }
 );
 
 watch(
-  () => props.images,
+  () => [props.lensProps, props.barProps, props.cubeProps],
   () => {
-    if (!scene) return;
-
-    imagePlanes.forEach(plane => {
-      scene?.remove(plane);
-      plane.geometry.dispose();
-      const material = plane.material as THREE.MeshBasicMaterial;
-      material.map?.dispose();
-      material.dispose();
-    });
-
-    imagePlanes = props.images.slice(0, DEFAULT_IMAGE_COUNT).map(createImagePlane);
-    imagePlanes.forEach(plane => scene?.add(plane));
-    updateLayout();
+    applyMaterialProps();
+    if (props.mode === 'bar') buildNavItems();
   },
   { deep: true }
 );
-
-onMounted(() => {
-  initializeScene();
-});
-
-onBeforeUnmount(() => {
-  destroyScene();
-});
 </script>
 
 <style scoped>
@@ -601,10 +824,8 @@ onBeforeUnmount(() => {
   overflow-y: auto;
   overflow-x: hidden;
   border-radius: 24px;
-  /*background:
-    radial-gradient(circle at top, rgba(140, 121, 255, 0.45), transparent 45%),
-    linear-gradient(180deg, #6d51ff 0%, #5227ff 50%, #3512c7 100%);*/
   scrollbar-width: none;
+  background: #5227ff;
 }
 
 .fluid-glass::-webkit-scrollbar {
@@ -624,42 +845,8 @@ onBeforeUnmount(() => {
   height: 100%;
 }
 
-.fluid-glass-scroll-spacer {
-  height: 260%;
+.fluid-glass-scroll {
+  height: 200%;
   pointer-events: none;
-}
-
-.fluid-glass-nav {
-  position: absolute;
-  left: 50%;
-  bottom: 18px;
-  z-index: 2;
-  display: flex;
-  gap: 0.85rem;
-  transform: translateX(-50%);
-  padding: 0.45rem 0.8rem;
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.08);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  box-shadow:
-    0 10px 30px rgba(0, 0, 0, 0.22),
-    inset 0 1px 0 rgba(255, 255, 255, 0.24);
-}
-
-.fluid-glass-nav-item {
-  padding: 0.2rem 0.45rem;
-  border: 0;
-  background: transparent;
-  color: #fff;
-  font-size: 0.86rem;
-  line-height: 1;
-  cursor: pointer;
-  transition: opacity 180ms ease;
-}
-
-.fluid-glass-nav-item:hover {
-  opacity: 0.75;
 }
 </style>
